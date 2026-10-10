@@ -1,0 +1,114 @@
+name: Backend - test and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time; never cancel a deploy that is already running.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Names created by infra/documind-stack.yaml (ProjectName=documind).
+  # Change these only if you changed ProjectName.
+  ECR_REPOSITORY: documind-backend
+  ECS_CLUSTER: documind
+  ECS_SERVICE: documind-backend
+  ECS_TASK_FAMILY: documind-backend
+  CONTAINER_NAME: backend
+
+jobs:
+  # Runs on every push and PR - no AWS access needed. Tests are pure unit tests
+  # (no database required).
+  test:
+    name: Run pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  # Only runs for pushes / manual runs on main.
+  deploy:
+    name: Build image, push to ECR, deploy to ECS
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # request the OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Require repo variables
+        run: |
+          missing=0
+          for v in AWS_REGION AWS_ROLE_ARN; do
+            case "$v" in
+              AWS_REGION)   val='${{ vars.AWS_REGION }}' ;;
+              AWS_ROLE_ARN) val='${{ vars.AWS_ROLE_ARN }}' ;;
+            esac
+            if [ -z "$val" ]; then echo "::error::Repository variable $v is not set"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Start from the live task definition so env vars / secrets / roles defined
+      # in CloudFormation are preserved; only the image changes.
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_FAMILY" \
+            --query taskDefinition > task-definition.json
+
+      - name: Render task definition with new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
